@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -218,3 +219,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+=======
+.venv/
+__pycache__/
+.pytest_cache/
+>>>>>>> cbe4c80 (Trades API: initial commit -- FastAPI service with validation and tests)
