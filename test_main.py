@@ -102,3 +102,68 @@ def test_exposure_groups_filters_and_sorts():
     assert body[0]["counterparty"] == "ACME"
     assert body[0]["trade_count"] == 2
     # Both ACME trades were grouped together (the GROUP BY part).
+
+
+# --- CSV upload ---
+
+HEADER = "trade_id,counterparty,trader,trade_date,notional\n"
+
+
+def upload(content, filename="trades.csv", content_type="text/csv"):
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    return client.post("/trades/upload", files={"file": (filename, content, content_type)})
+
+
+def test_upload_valid_csv_creates_trades():
+    csv_text = HEADER + "T1,ACME,alice,2026-10-01,1000\nT2,GLOBEX,bob,2026-10-02,2000\n"
+    response = upload(csv_text)
+    assert response.status_code == 200
+    assert response.json() == {"created": 2, "failed": 0, "errors": []}
+    assert client.get("/trades/T2").json()["counterparty"] == "GLOBEX"
+
+
+def test_upload_reports_bad_rows_and_keeps_good_ones():
+    csv_text = (
+        HEADER
+        + "T1,ACME,alice,2026-10-01,1000\n"     # line 2: valid
+        + "T2,ACME,alice,2026-10-01,-5\n"       # line 3: negative notional
+        + "T3,ACME,alice,not-a-date,1000\n"     # line 4: bad date
+        + "T1,ACME,alice,2026-10-01,1000\n"     # line 5: duplicate of line 2
+    )
+    body = upload(csv_text).json()
+    assert body["created"] == 1
+    assert body["failed"] == 3
+    assert [e["line"] for e in body["errors"]] == [3, 4, 5]
+    assert "notional" in body["errors"][0]["error"]
+    assert body["errors"][2]["error"] == "Duplicate trade_id"
+
+
+def test_upload_rejects_non_csv_extension():
+    assert upload(HEADER, filename="trades.txt").status_code == 415
+
+
+def test_upload_rejects_wrong_content_type():
+    assert upload(HEADER, content_type="image/png").status_code == 415
+
+
+def test_upload_rejects_file_over_size_limit():
+    big = HEADER + "x" * 1_000_001
+    assert upload(big).status_code == 413
+
+
+def test_upload_rejects_missing_columns():
+    response = upload("trade_id,counterparty\nT1,ACME\n")
+    assert response.status_code == 400
+    assert "notional" in response.json()["detail"]
+
+
+def test_upload_rejects_non_utf8_file():
+    assert upload(b"\xff\xfe\x00bad").status_code == 400
+
+
+def test_sample_file_uploads_as_expected():
+    with open("sample_trades.csv", "rb") as f:
+        body = upload(f.read()).json()
+    assert body["created"] == 4
+    assert body["failed"] == 4

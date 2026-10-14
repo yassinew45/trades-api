@@ -7,6 +7,10 @@
 # ---------------------------------------------------------------------------
 # Standard library first, third-party second, blank line between (PEP 8 style).
 
+import csv
+import io
+# csv and io to parse the file;
+
 from collections import defaultdict
 # defaultdict: a dict that creates a default value for a missing key instead of
 # raising KeyError. defaultdict(int)[k] starts at 0, defaultdict(list)[k] at [].
@@ -18,22 +22,30 @@ from decimal import Decimal
 # Decimal: exact base-10 numbers. Floats are binary, so 0.1 + 0.2 != 0.3.
 # For money you want exact arithmetic, so we use Decimal (like BigDecimal in Java).
 
-from typing import Optional
+from typing import List, Optional
 # Optional[str] means "a str or None". On Python 3.10+ you can write str | None.
+# List for 3.9-compatible type hints
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, File, UploadFile
 # FastAPI: the application object (roughly the Spring Boot application context).
 # HTTPException: raise it to return an HTTP error response with a status code.
 # status: named constants like status.HTTP_404_NOT_FOUND, clearer than bare 404.
+# File and UploadFile to receive the upload
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 # Pydantic does data validation. Subclass BaseModel to describe the shape of data.
 # Field(...) adds constraints such as minimum length or "greater than zero".
+# ValidationError to catch bad rows.
 
-app = FastAPI(title="Trades API", version="0.1.0")
+
+
+app = FastAPI(title="Trades API", version="0.2.0")
 # Create the app. title and version show up in the auto-generated docs at /docs.
 # Uvicorn finds this object when you run `uvicorn main:app` (module main, object app).
 
+MAX_UPLOAD_BYTES = 1_000_000  # 1 MB # The underscores in 1_000_000 are only for readability; Python ignores them.
+ALLOWED_CONTENT_TYPES = {"text/csv", "application/vnd.ms-excel", "text/plain"}
+REQUIRED_COLUMNS = {"trade_id", "counterparty", "trader", "trade_date", "notional"}
 
 # ---------------------------------------------------------------------------
 # Models: the shape of the data coming in and going out
@@ -72,6 +84,19 @@ class Exposure(BaseModel):
     # so no precision is lost in transit.
     trade_count: int
 
+
+class RowError(BaseModel):
+    # RowError describes one bad row.
+    line: int
+    trade_id: Optional[str] = None
+    error: str
+
+
+class UploadResult(BaseModel):
+    # UploadResult is the endpoint’s response.
+    created: int
+    failed: int
+    errors: List[RowError]
 
 # ---------------------------------------------------------------------------
 # Storage
@@ -123,6 +148,66 @@ def create_trade(trade: Trade) -> Trade:
     trades[trade.trade_id] = trade
     # Store the trade under its ID.
     return trade
+    
+    
+@app.post("/trades/upload")
+async def upload_trades(file: UploadFile = File(...)) -> UploadResult:
+    """Upload a CSV of trades. Valid rows are booked; invalid rows are reported."""
+    # 1. File-level checks: reject the whole file if any of these fail.
+    if not (file.filename or "").lower().endswith(".csv"):
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "File must be a .csv")
+    if file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, f"Unsupported content type: {file.content_type}"
+        )
+
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        # 413 Content Too Large (written as a number: the constant's name differs by version)
+        raise HTTPException(413, "File is larger than 1 MB")
+
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "File must be UTF-8 encoded text")
+
+    reader = csv.DictReader(io.StringIO(text))
+    missing = REQUIRED_COLUMNS - set(reader.fieldnames or [])
+    if missing:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, f"Missing columns: {', '.join(sorted(missing))}"
+        )
+
+    # 2. Row-level checks: book each valid row, collect an error for each bad one.
+    created = 0
+    errors: List[RowError] = []
+    for line_no, row in enumerate(reader, start=2):  # line 1 is the header
+        trade_id = (row.get("trade_id") or "").strip() or None
+        try:
+            trade = Trade.model_validate(row)
+        except ValidationError as exc:
+            message = "; ".join(
+                f"{'.'.join(str(part) for part in err['loc'])}: {err['msg']}" for err in exc.errors()
+            )
+            errors.append(RowError(line=line_no, trade_id=trade_id, error=message))
+            continue
+
+        if trade.trade_id in trades:
+            errors.append(RowError(line=line_no, trade_id=trade_id, error="Duplicate trade_id"))
+            continue
+
+        trades[trade.trade_id] = trade
+        created += 1
+
+    return UploadResult(created=created, failed=len(errors), errors=errors)
+    # async def and await file.read(...): reading an upload is I/O, so the function is async. FastAPI supports both def and async def endpoints.
+    # file.read(MAX_UPLOAD_BYTES + 1): reads at most one byte past the limit. If that extra byte arrives, the file is too big, and you never load a huge file into memory.
+    # "utf-8-sig": decodes UTF-8 and also strips the invisible marker Excel puts at the start of CSVs it saves.
+    # csv.DictReader: turns each row into a dict keyed by the header, for example {"trade_id": "T100", ...}. That’s exactly the shape Pydantic wants.
+    # REQUIRED_COLUMNS - set(...): set difference, meaning the required columns that aren’t in the header.
+    # Trade.model_validate(row): runs the same validation rules as POST /trades, so the rules live in one place.
+    # continue: skips to the next row, so one bad row doesn’t stop the rest.
+    # The duplicate check: it uses the store, so it catches trades already booked and repeats within the same file. Each valid row is stored before the next row is checked.
 
 
 @app.get("/trades/{trade_id}")

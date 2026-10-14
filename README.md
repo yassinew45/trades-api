@@ -17,6 +17,7 @@ A small FastAPI practice service for ingesting trades and reporting exposure by 
 |--------|------|-------------|
 | GET | `/health` | Health check |
 | POST | `/trades` | Book a trade |
+| POST | `/trades/upload` | Upload a CSV of trades; valid rows are booked, bad rows reported by line |
 | GET | `/trades/{trade_id}` | Get one trade |
 | GET | `/trades?counterparty=X` | List trades, optionally by counterparty |
 | GET | `/exposure?min_notional=N` | Total notional per counterparty above N |
@@ -42,4 +43,4 @@ pytest -v
 
 - Replace the in-memory store with a database
 - Bulk CSV upload endpoint with per-row validation errors
->>>>>>> cbe4c80 (Trades API: initial commit -- FastAPI service with validation and tests)
+- All-or-nothing upload mode (reject the file if any row fails)
